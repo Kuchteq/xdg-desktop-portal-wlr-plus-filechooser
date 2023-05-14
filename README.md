@@ -1,8 +1,6 @@
-# xdg-desktop-portal-wlr
+# xdg-desktop-portal-plus-filechooser
 
-[![builds.sr.ht status](https://builds.sr.ht/~emersion/xdg-desktop-portal-wlr/commits/master.svg)](https://builds.sr.ht/~emersion/xdg-desktop-portal-wlr/commits/master?)
-
-[xdg-desktop-portal] backend for wlroots
+[xdg-desktop-portal] backend for wlroots. A slightly modified version that integrates the wlroots functionality of screen recording and [GermainZ](https://github.com/GermainZ)'s [xdg-desktop-portal-termfilechooser](https://github.com/GermainZ/xdg-desktop-portal-termfilechooser) with some patches of [Boydaihungst](https://github.com/boydaihungst/xdg-desktop-portal-termfilechooser)'s fork. I would like it one day to be merged into mainline as from my testing everything seems to work fine but I'm afraid if it were to be deployed at a large scale.
 
 ## Building
 
@@ -18,11 +16,6 @@ ninja -C build
 ```sh
 ninja -C build install
 ```
-
-### Distro Packages
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/xdg-desktop-portal-wlr.svg)](https://repology.org/project/xdg-desktop-portal-wlr/versions)
-
 
 ## Running
 
