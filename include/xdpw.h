@@ -14,6 +14,11 @@
 #include "screenshot_common.h"
 #include "config.h"
 
+//Not entirely sure if I need it
+#include <stdbool.h>
+#include <errno.h>
+#include <stdlib.h>
+
 struct xdpw_state {
 	struct wl_list xdpw_sessions;
 	sd_bus *bus;
@@ -59,6 +64,7 @@ enum {
 
 int xdpw_screenshot_init(struct xdpw_state *state);
 int xdpw_screencast_init(struct xdpw_state *state);
+int xdpw_filechooser_init(struct xdpw_state *state);
 
 struct xdpw_request *xdpw_request_create(sd_bus *bus, const char *object_path);
 void xdpw_request_destroy(struct xdpw_request *req);

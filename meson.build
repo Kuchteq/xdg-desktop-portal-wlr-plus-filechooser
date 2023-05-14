@@ -77,6 +77,7 @@ xdpw_files = files([
 	'src/screencast/wlr_screencast.c',
 	'src/screencast/pipewire_screencast.c',
 	'src/screencast/fps_limit.c',
+    'src/filechooser/filechooser.c',
 ])
 
 executable(

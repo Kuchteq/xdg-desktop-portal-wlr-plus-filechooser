@@ -14,8 +14,14 @@ struct config_screencast {
 	bool force_mod_linear;
 };
 
+struct config_filechooser {
+    char *cmd;
+    char *default_dir;
+};
+
 struct xdpw_config {
 	struct config_screencast screencast_conf;
+	struct config_filechooser filechooser_conf;
 };
 
 void print_config(enum LOGLEVEL loglevel, struct xdpw_config *config);

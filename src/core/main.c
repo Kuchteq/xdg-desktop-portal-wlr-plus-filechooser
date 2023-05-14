@@ -123,6 +123,7 @@ int main(int argc, char *argv[]) {
 		.config = &config,
 	};
 
+    xdpw_filechooser_init(&state);
 	wl_list_init(&state.xdpw_sessions);
 
 	ret = xdpw_screenshot_init(&state);
