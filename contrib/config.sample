@@ -1,3 +1,7 @@
+[filechooser]
+cmd=/home/youruser/.config/xdg-desktop-portal-wlr/lf-wrapper.sh
+default_dir=/home/youruser
+
 [screencast]
 output_name=
 max_fps=30

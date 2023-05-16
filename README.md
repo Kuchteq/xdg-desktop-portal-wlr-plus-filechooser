@@ -1,6 +1,13 @@
 # xdg-desktop-portal-plus-filechooser
 
-[xdg-desktop-portal] backend for wlroots. A slightly modified version that integrates the wlroots functionality of screen recording and [GermainZ](https://github.com/GermainZ)'s [xdg-desktop-portal-termfilechooser](https://github.com/GermainZ/xdg-desktop-portal-termfilechooser) with some patches of [Boydaihungst](https://github.com/boydaihungst/xdg-desktop-portal-termfilechooser)'s fork. I would like it one day to be merged into mainline as from my testing everything seems to work fine but I'm afraid if it were to be deployed at a large scale.
+### Note that filepicking was mainly tested with lf file manager. I can't attest that others work properly!
+
+[xdg-desktop-portal] backend for wlroots. A slightly modified version that integrates the wlroots functionality of screen recording and [GermainZ](https://github.com/GermainZ)'s [xdg-desktop-portal-termfilechooser](https://github.com/GermainZ/xdg-desktop-portal-termfilechooser) with some patches of [Boydaihungst](https://github.com/boydaihungst/xdg-desktop-portal-termfilechooser)'s fork, so credits go mainly to them. My contributions include merging two codebases and adding better handling for lf file manager. I would like it one day to be merged into mainline as from my testing everything seems to work fine but I'm afraid if it were to be deployed at a large scale.
+
+# Filechooser configuration
+```mkdir ~/.config/xdg-desktop-portal-wlr```
+and create a config file (in the contrib folder there is a sample one, remember to change the name)
+there you can adjust what filepicker script to execute (along with regular xdg-desktop-portal-wlr config options related to screenrecording). Choose the script corresponding to your file picker of choice and place it in corresponding location (must use absolute full path). (lf wrapper has extra configuration that needs to be done). After that continue with the [running guide](#Running).
 
 ## Building
 
@@ -8,6 +15,8 @@
 meson build
 ninja -C build
 ```
+
+The fork also includes a PKGBUILD file for arch users, so you can just run ```makepkg``` inside the folder.
 
 ## Installing
 
