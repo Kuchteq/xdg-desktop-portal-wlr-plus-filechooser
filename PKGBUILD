@@ -20,8 +20,16 @@ optdepends=(
 
 build() {
     cd ../
-    arch-meson -Dsd-bus-provider=libsystemd build
-    ninja -C build
+ if  echo $(ps 1) | grep -q "runit"; then
+         local meson_options=(
+         -D sd-bus-provider=libelogind
+         -D systemd=disabled)
+         else
+         local meson_options=(-D sd-bus-provider=libsystemd)
+     fi
+     rm -rf build
+     arch-meson build "${meson_options[@]}"
+	 ninja -C build
 }
 
 package() {
