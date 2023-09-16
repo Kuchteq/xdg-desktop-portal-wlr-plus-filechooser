@@ -2,7 +2,7 @@
 # IMPORTANT INFO
 # THE SCRIPT REQUIRES LF config integration. Add "inportal" file to you lf config folder and include this line anywhere inside your main config (lfrc):
 # cmd inportal source "~/.config/lf/inportal"
-# The script also assumes you are using the foot terminal. -o gives a small padding around the terminal and -a sets the appid for the window which is helpfull for WM config files since you can more easily make the newly opened window floatable. If you are using something else, just adjust cmd variable
+# The script also assumes you are using the foot terminal. -o gives a small padding around the terminal and -a sets the appid for the window which is helpfull for WM config files since you can more easily make the newly selected window floatable. If you are using something else, just adjust cmd variable
 #
 # More technical info
 # This wrapper script is invoked by xdg-desktop-portal-termfilechooser.
@@ -10,7 +10,7 @@
 # Inputs:
 # 1. "1" if multiple files can be chosen, "0" otherwise.
 # 2. "1" if a directory should be chosen, "0" otherwise.
-# 3. "0" if opening files was requested, "1" if writing to a file was
+# 3. "0" if selecting files was requested, "1" if writing to a file was
 #    requested. For example, when uploading files in Firefox, this will be "0".
 #    When saving a web page in Firefox, this will be "1".
 # 4. If writing to a file, this is recommended path provided by the caller. For
@@ -25,8 +25,6 @@
 # one path per line.
 # If nothing is printed, then the operation is assumed to have been canceled.
 
-# Set default folder when download.
-default_dir="$HOME"
 multiple="$1"
 directory="$2"
 save="$3"
@@ -34,18 +32,25 @@ path="$4"
 out="$5"
 cmd="/usr/bin/lf"
 termcmd="/usr/bin/foot"
+lfxdgbasedir="~/.config/lf/xdg-filepicker"
 
 if [ "$save" = "1" ]; then
-	set --
-LF_PORTAL_ARG="$path" $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd -command inportal "$@"
-
+	#make the saving appear in the last path
+	set -- "$(dirname "$path")"
+        FILENAME="$(basename "$path")"
+        $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd \
+        -command "set user_filename '$FILENAME'" \
+        -command "source $lfxdgbasedir/save" "$@"
+elif [ "$directory" = "1" ] && [ "$multiple" = "1" ] ; then
+            $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd \
+            -command "source $lfxdgbasedir/selectanything" 
 elif [ "$directory" = "1" ]; then
-	set -- -selection-path "$out" "$default_dir"
-$termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd "$@"
+            $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd \
+            -command "source $lfxdgbasedir/selectdir" 
 elif [ "$multiple" = "1" ]; then
-	set -- -selection-path "$out" "$default_dir"
-$termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd "$@"
+            $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd \
+            -command "source $lfxdgbasedir/selectfiles"
 else
-	set -- -selection-path "$out" "$default_dir"
-$termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd "$@"
+            $termcmd -o "main.pad=10x10 center" -a "floatermid" -W "120x40" $cmd \
+            -command "source $lfxdgbasedir/selectfile"
 fi

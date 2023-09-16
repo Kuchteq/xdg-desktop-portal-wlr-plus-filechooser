@@ -6,11 +6,14 @@
 
 ## Filechooser configuration
 ```mkdir ~/.config/xdg-desktop-portal-wlr```
-and create a config file (in the contrib folder there is a sample one, remember to change the name)
-there you can adjust what filepicker script to execute (along with regular xdg-desktop-portal-wlr config options related to screenrecording). Choose the script corresponding to your file picker of choice and place it in corresponding location (must use absolute full path). (lf wrapper has extra configuration that needs to be done). After that continue with the [running guide](#Running).
+and create a file name `config` there. The contents of that file can be taken from config.sample inside contrib folder.
+There you can adjust what filepicker script to execute (along with regular xdg-desktop-portal-wlr config options related to screenrecording). Choose the script corresponding to your file picker of choice and place it in corresponding location (must use absolute full path). (lf wrapper has extra configuration that needs to be done [see lf section](#lf). After that continue with the [running guide](#Running).
 
 ## Remember that the app you are running needs to utilise xdg-portals!
 For example with firefox, it's not enabled by default. To have it working you need to either run firefox with ```GTK_USE_PORTAL=1 firefox``` or for permanent configuration, change the *widget.use-xdg-desktop-portal.file-picker* to 1 in about:config settings page. Chromium-based browsers should use portals out of the box.
+
+## Lf config
+The lf file manager is being taliored to file picking by the lf config files present in `contrib/lf/xdg-filepicker`. You need to copy it to the folder where lfrc is (`~/.config/xdg-desktop-portal-wlr/lf`) and copy over `lf-wrapper.sh` that is also present there to `~/.config/xdg-desktop-portal-wlr`. The main xdg-desktop-portal-wlr should be then pointing to that script (it does by default if using the config present in the contrib folder).
 
 ## Building
 
