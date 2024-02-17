@@ -20,12 +20,12 @@ optdepends=(
 
 build() {
     cd ../
- if  echo $(ps 1) | grep -q "runit"; then
-         local meson_options=(
-         -D sd-bus-provider=libelogind
-         -D systemd=disabled)
-         else
-         local meson_options=(-D sd-bus-provider=libsystemd)
+    if ps -p 1 -o comm= | grep -q "systemd"; then
+			 local meson_options=(-D sd-bus-provider=libsystemd)
+	     else
+			 local meson_options=(
+			 -D sd-bus-provider=libelogind
+			 -D systemd=disabled)
      fi
      rm -rf build
      arch-meson build "${meson_options[@]}"
