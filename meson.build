@@ -1,9 +1,9 @@
 project(
 	'xdg-desktop-portal-wlr',
 	'c',
-	version: '0.7.0',
+	version: '0.7.1',
 	license: 'MIT',
-	meson_version: '>=0.58.0',
+	meson_version: '>=0.60.0',
 	default_options: ['c_std=c11', 'warning_level=2', 'werror=true'],
 )
 
@@ -18,7 +18,7 @@ add_project_arguments(cc.get_supported_arguments([
 
 prefix = get_option('prefix')
 sysconfdir = get_option('sysconfdir')
-add_project_arguments('-DSYSCONFDIR="@0@"'.format(join_paths(prefix, sysconfdir)), language : 'c')
+add_project_arguments('-DSYSCONFDIR="@0@"'.format(prefix / sysconfdir), language : 'c')
 
 inc = include_directories('include')
 
@@ -37,24 +37,7 @@ endif
 
 if get_option('sd-bus-provider') == 'auto'
 	assert(get_option('auto_features').auto(), 'sd-bus-provider must not be set to auto since auto_features != auto')
-	sdbus = dependency('libsystemd',
-		required: false,
-		not_found_message: 'libsystemd not found, trying libelogind',
-	)
-	if not sdbus.found()
-		sdbus = dependency('libelogind',
-			required: false,
-			not_found_message: 'libelogind not found, trying basu',
-		)
-	endif
-	if not sdbus.found()
-		sdbus = dependency('basu',
-			required: false,
-		)
-	endif
-	if not sdbus.found()
-		error('Neither libsystemd, nor libelogind, nor basu was found')
-	endif
+	sdbus = dependency(['libsystemd', 'libelogind', 'basu'])
 else
 	sdbus = dependency(get_option('sd-bus-provider'))
 endif
@@ -62,7 +45,7 @@ add_project_arguments('-DHAVE_' + sdbus.name().to_upper() + '=1', language: 'c')
 
 subdir('protocols')
 
-xdpw_files = files([
+xdpw_files = files(
 	'src/core/main.c',
 	'src/core/logger.c',
 	'src/core/config.c',
@@ -98,12 +81,10 @@ executable(
 )
 
 conf_data = configuration_data()
-conf_data.set('libexecdir',
-	join_paths(get_option('prefix'), get_option('libexecdir')))
+conf_data.set('libexecdir', get_option('prefix') / get_option('libexecdir'))
 conf_data.set('systemd_service', '')
 
 systemd = dependency('systemd', required: get_option('systemd'))
-
 if systemd.found()
 	systemd_service_file = 'xdg-desktop-portal-wlr.service'
 	user_unit_dir = systemd.get_variable(pkgconfig: 'systemduserunitdir',
@@ -122,16 +103,18 @@ configure_file(
 	configuration: conf_data,
 	input: 'org.freedesktop.impl.portal.desktop.wlr.service.in',
 	output: '@BASENAME@',
-	install_dir: join_paths(get_option('datadir'), 'dbus-1', 'services'),
+	install_dir: get_option('datadir') / 'dbus-1' / 'services',
 )
 
 install_data(
 	'wlr.portal',
-	install_dir: join_paths(get_option('datadir'), 'xdg-desktop-portal', 'portals'),
+	install_dir: get_option('datadir') / 'xdg-desktop-portal' / 'portals',
 )
 
 scdoc = dependency('scdoc', required: get_option('man-pages'), version: '>= 1.9.7', native: true)
 if scdoc.found()
+	scdoc_prog = find_program(scdoc.get_variable(pkgconfig: 'scdoc'), native: true)
+
 	man_pages = ['xdg-desktop-portal-wlr.5.scd']
 	foreach src : man_pages
 		topic = src.split('.')[0]
@@ -142,11 +125,11 @@ if scdoc.found()
 			output,
 			input: files(src),
 			output: output,
-			command: [
-				'sh', '-c', '@0@ < @INPUT@ > @1@'.format(scdoc.get_variable(pkgconfig: 'scdoc'), output)
-			],
+			command: scdoc_prog,
+			feed: true,
+			capture: true,
 			install: true,
-			install_dir: join_paths(get_option('mandir'), 'man' + section),
+			install_dir: get_option('mandir') / ('man' + section),
 		)
 	endforeach
 endif

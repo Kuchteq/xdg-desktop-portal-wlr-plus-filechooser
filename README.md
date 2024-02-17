@@ -43,6 +43,17 @@ can be added to your config file:
 When correctly installed, xdg-desktop-portal should automatically invoke
 xdg-desktop-portal-wlr when needed.
 
+[Recent changes](https://www.bassi.io/articles/2023/05/29/configuring-portals/) to xdg-desktop-portal is requiring desktop environments to set up a `*-portals.conf` configuration that specify which portals should be used for a given `XDG_CURRENT_DESKTOP` value. If this file does not exists in `/usr/share/xdg-desktop-portal/`, you should create it under `~/.config/xdg-desktop-portal/` with content like this:
+
+```ini
+[preferred]
+default=gtk
+org.freedesktop.impl.portal.Screenshot=wlr
+org.freedesktop.impl.portal.ScreenCast=wlr
+```
+
+(you can specify the default portal to use for any implementation not explicitly defined, and you can add any portal you need for other specific interfaces like gnome-keyring for the Secret portal).
+
 ### Configuration
 
 See `man 5 xdg-desktop-portal-wlr`.
