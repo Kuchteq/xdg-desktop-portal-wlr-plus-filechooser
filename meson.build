@@ -45,7 +45,7 @@ add_project_arguments('-DHAVE_' + sdbus.name().to_upper() + '=1', language: 'c')
 
 subdir('protocols')
 
-xdpw_files = files(
+xdpw_files = files([
 	'src/core/main.c',
 	'src/core/logger.c',
 	'src/core/config.c',
