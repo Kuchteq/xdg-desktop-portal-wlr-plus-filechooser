@@ -2,7 +2,7 @@
 # Maintainer: Maxim Baz <$pkgname at maximbaz dot com>
 # Contributor: Stefan Tatschner <stefan@rumpelsepp.org>
 
-pkgname=xdg-desktop-portal-wlr
+pkgname=xdg-desktop-portal-wlr-plus-filechooser
 pkgver=0.7.1
 pkgrel=1
 pkgdesc='xdg-desktop-portal backend for wlroots'
@@ -17,6 +17,7 @@ optdepends=(
     'wofi: to choose which output to screencast using wofi'
     'bemenu: to choose which output to screencast using bemenu'
 )
+conflicts=("xdg-desktop-portal-wlr")
 
 build() {
     cd ../

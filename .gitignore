@@ -6,6 +6,8 @@
 *.ko
 *.obj
 *.elf
+.cache
+pkg
 
 # Linker output
 *.ilk
