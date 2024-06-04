@@ -3,6 +3,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include <drm_fourcc.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -18,247 +19,27 @@
 #include <xf86drm.h>
 
 #include "screencast.h"
-#include "pipewire_screencast.h"
+#include "wlr_screencopy.h"
 #include "xdpw.h"
 #include "logger.h"
-#include "fps_limit.h"
 
-void wlr_frame_free(struct xdpw_screencast_instance *cast) {
-	if (!cast->wlr_frame) {
-		return;
-	}
-	zwlr_screencopy_frame_v1_destroy(cast->wlr_frame);
-	cast->wlr_frame = NULL;
-	logprint(TRACE, "wlroots: frame destroyed");
-}
-
-void xdpw_wlr_frame_finish(struct xdpw_screencast_instance *cast) {
-	logprint(TRACE, "wlroots: finish screencopy");
-
-	wlr_frame_free(cast);
-
-	if (cast->quit || cast->err) {
-		// TODO: revisit the exit condition (remove quit?)
-		// and clean up sessions that still exist if err
-		// is the cause of the instance_destroy call
-		xdpw_screencast_instance_destroy(cast);
-		return;
-	}
-
-	if (!cast->pwr_stream_state) {
-		cast->frame_state = XDPW_FRAME_STATE_NONE;
-		return;
-	}
-
-	if (cast->frame_state == XDPW_FRAME_STATE_RENEG) {
-		pwr_update_stream_param(cast);
-	}
-
-	if (cast->frame_state == XDPW_FRAME_STATE_FAILED) {
-		xdpw_pwr_enqueue_buffer(cast);
-	}
-
-	if (cast->frame_state == XDPW_FRAME_STATE_SUCCESS) {
-		xdpw_pwr_enqueue_buffer(cast);
-		uint64_t delay_ns = fps_limit_measure_end(&cast->fps_limit, cast->framerate);
-		if (delay_ns > 0) {
-			xdpw_add_timer(cast->ctx->state, delay_ns,
-				(xdpw_event_loop_timer_func_t) xdpw_wlr_frame_start, cast);
-			return;
-		}
-	}
-	xdpw_wlr_frame_start(cast);
-}
-
-void xdpw_wlr_frame_start(struct xdpw_screencast_instance *cast) {
-	logprint(TRACE, "wlroots: start screencopy");
-	if (cast->quit || cast->err) {
-		xdpw_screencast_instance_destroy(cast);
-		return;
-	}
-
-	if (cast->initialized && !cast->pwr_stream_state) {
-		cast->frame_state = XDPW_FRAME_STATE_NONE;
-		return;
-	}
-
-	cast->frame_state = XDPW_FRAME_STATE_STARTED;
-	xdpw_wlr_register_cb(cast);
-}
-
-static void wlr_frame_buffer_done(void *data,
-		struct zwlr_screencopy_frame_v1 *frame);
-
-static void wlr_frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
-		uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: buffer event handler");
-	cast->wlr_frame = frame;
-
-	cast->screencopy_frame_info[WL_SHM].width = width;
-	cast->screencopy_frame_info[WL_SHM].height = height;
-	cast->screencopy_frame_info[WL_SHM].stride = stride;
-	cast->screencopy_frame_info[WL_SHM].size = stride * height;
-	cast->screencopy_frame_info[WL_SHM].format = xdpw_format_drm_fourcc_from_wl_shm(format);
-
-	if (zwlr_screencopy_manager_v1_get_version(cast->ctx->screencopy_manager) < 3) {
-		wlr_frame_buffer_done(cast, frame);
+void xdpw_wlr_frame_capture(struct xdpw_screencast_instance *cast) {
+	if (cast->ctx->screencopy_manager) {
+		xdpw_wlr_sc_frame_capture(cast);
 	}
 }
 
-static void wlr_frame_linux_dmabuf(void *data,
-		struct zwlr_screencopy_frame_v1 *frame,
-		uint32_t format, uint32_t width, uint32_t height) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: linux_dmabuf event handler");
-
-	cast->screencopy_frame_info[DMABUF].width = width;
-	cast->screencopy_frame_info[DMABUF].height = height;
-	cast->screencopy_frame_info[DMABUF].format = format;
-}
-
-static void wlr_frame_buffer_done(void *data,
-		struct zwlr_screencopy_frame_v1 *frame) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: buffer_done event handler");
-
-	if (!cast->initialized) {
-		xdpw_wlr_frame_finish(cast);
-		return;
-	}
-
-	// Check if announced screencopy information is compatible with pipewire meta
-	if ((cast->pwr_format.format != xdpw_format_pw_from_drm_fourcc(cast->screencopy_frame_info[cast->buffer_type].format) &&
-			cast->pwr_format.format != xdpw_format_pw_strip_alpha(xdpw_format_pw_from_drm_fourcc(cast->screencopy_frame_info[cast->buffer_type].format))) ||
-			cast->pwr_format.size.width != cast->screencopy_frame_info[cast->buffer_type].width ||
-			cast->pwr_format.size.height != cast->screencopy_frame_info[cast->buffer_type].height) {
-		logprint(DEBUG, "wlroots: pipewire and wlroots metadata are incompatible. Renegotiate stream");
-		cast->frame_state = XDPW_FRAME_STATE_RENEG;
-		xdpw_wlr_frame_finish(cast);
-		return;
-	}
-
-	if (!cast->current_frame.xdpw_buffer) {
-		xdpw_pwr_dequeue_buffer(cast);
-	}
-
-	if (!cast->current_frame.xdpw_buffer) {
-		logprint(WARN, "wlroots: no current buffer");
-		xdpw_wlr_frame_finish(cast);
-		return;
-	}
-
-	assert(cast->current_frame.xdpw_buffer);
-
-	// Check if dequeued buffer is compatible with announced buffer
-	if (( cast->buffer_type == WL_SHM &&
-				(cast->current_frame.xdpw_buffer->size[0] != cast->screencopy_frame_info[cast->buffer_type].size ||
-				cast->current_frame.xdpw_buffer->stride[0] != cast->screencopy_frame_info[cast->buffer_type].stride)) ||
-			cast->current_frame.xdpw_buffer->width != cast->screencopy_frame_info[cast->buffer_type].width ||
-			cast->current_frame.xdpw_buffer->height != cast->screencopy_frame_info[cast->buffer_type].height) {
-		logprint(DEBUG, "wlroots: pipewire buffer has wrong dimensions");
-		cast->frame_state = XDPW_FRAME_STATE_FAILED;
-		xdpw_wlr_frame_finish(cast);
-		return;
-	}
-
-	cast->current_frame.damage_count = 0;
-	zwlr_screencopy_frame_v1_copy_with_damage(frame, cast->current_frame.xdpw_buffer->buffer);
-	logprint(TRACE, "wlroots: frame copied");
-
-	fps_limit_measure_start(&cast->fps_limit, cast->framerate);
-}
-
-static void wlr_frame_flags(void *data, struct zwlr_screencopy_frame_v1 *frame,
-		uint32_t flags) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: flags event handler");
-	cast->current_frame.y_invert = flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT;
-}
-
-static void wlr_frame_damage(void *data, struct zwlr_screencopy_frame_v1 *frame,
-		uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: damage event handler");
-
-	logprint(TRACE, "wlroots: damage %"PRIu32": %"PRIu32",%"PRIu32"x%"PRIu32",%"PRIu32, cast->current_frame.damage_count, x, y, width, height);
-	struct xdpw_frame_damage damage = {x, y, width, height};
-	if (cast->current_frame.damage_count < 4) {
-		cast->current_frame.damage[cast->current_frame.damage_count++] = damage;
-	} else {
-		cast->current_frame.damage[3] = merge_damage(&cast->current_frame.damage[3], &damage);
+void xdpw_wlr_session_close(struct xdpw_screencast_instance *cast) {
+	if (cast->ctx->screencopy_manager) {
+		xdpw_wlr_sc_session_close(cast);
 	}
 }
 
-static void wlr_frame_ready(void *data, struct zwlr_screencopy_frame_v1 *frame,
-		uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
+int xdpw_wlr_session_init(struct xdpw_screencast_instance *cast) {
+	if (cast->ctx->screencopy_manager) {
+		return xdpw_wlr_sc_session_init(cast);
 	}
-
-	logprint(TRACE, "wlroots: ready event handler");
-
-	cast->current_frame.tv_sec = ((((uint64_t)tv_sec_hi) << 32) | tv_sec_lo);
-	cast->current_frame.tv_nsec = tv_nsec;
-	logprint(TRACE, "wlroots: timestamp %"PRIu64":%"PRIu32, cast->current_frame.tv_sec, cast->current_frame.tv_nsec);
-
-	cast->frame_state = XDPW_FRAME_STATE_SUCCESS;
-
-	xdpw_wlr_frame_finish(cast);
-}
-
-static void wlr_frame_failed(void *data,
-		struct zwlr_screencopy_frame_v1 *frame) {
-	struct xdpw_screencast_instance *cast = data;
-	if (!frame) {
-		return;
-	}
-
-	logprint(TRACE, "wlroots: failed event handler");
-
-	cast->frame_state = XDPW_FRAME_STATE_FAILED;
-
-	xdpw_wlr_frame_finish(cast);
-}
-
-static const struct zwlr_screencopy_frame_v1_listener wlr_frame_listener = {
-	.buffer = wlr_frame_buffer,
-	.buffer_done = wlr_frame_buffer_done,
-	.linux_dmabuf = wlr_frame_linux_dmabuf,
-	.flags = wlr_frame_flags,
-	.ready = wlr_frame_ready,
-	.failed = wlr_frame_failed,
-	.damage = wlr_frame_damage,
-};
-
-void xdpw_wlr_register_cb(struct xdpw_screencast_instance *cast) {
-	cast->frame_callback = zwlr_screencopy_manager_v1_capture_output(
-		cast->ctx->screencopy_manager, cast->target->with_cursor, cast->target->output->output);
-
-	zwlr_screencopy_frame_v1_add_listener(cast->frame_callback,
-		&wlr_frame_listener, cast);
-	logprint(TRACE, "wlroots: callbacks registered");
+	return -1;
 }
 
 static void wlr_output_handle_geometry(void *data, struct wl_output *wl_output,
@@ -845,7 +626,7 @@ static void wlr_registry_handle_remove(void *data, struct wl_registry *reg,
 		wl_list_for_each_safe(cast, tmp, &ctx->screencast_instances, link) {
 			if (cast->target->output == output) {
 				// screencopy might be in process for this instance
-				wlr_frame_free(cast);
+				xdpw_wlr_session_close(cast);
 				// instance might be waiting for wakeup by the frame limiter
 				struct xdpw_timer *timer, *ttmp;
 				wl_list_for_each_safe(timer, ttmp, &cast->ctx->state->timers, link) {

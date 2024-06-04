@@ -118,35 +118,37 @@ static int method_screenshot(sd_bus_message *msg, void *data,
 
 	// TODO: choose a better path
 	const char path[] = "/tmp/out.png";
+	const char uri[] = "file:///tmp/out.png";
 	if (interactive && !exec_screenshooter_interactive(path)) {
-		return -1;
+		ret = -1;
+		goto destroy_request;
 	}
 	if (!interactive && !exec_screenshooter(path)) {
-		return -1;
+		ret = -1;
+		goto destroy_request;
 	}
-
-	const char uri_prefix[] = "file://";
-	char uri[strlen(path) + strlen(uri_prefix) + 1];
-	snprintf(uri, sizeof(uri), "%s%s", uri_prefix, path);
 
 	sd_bus_message *reply = NULL;
 	ret = sd_bus_message_new_method_return(msg, &reply);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
 	ret = sd_bus_message_append(reply, "ua{sv}", PORTAL_RESPONSE_SUCCESS, 1, "uri", "s", uri);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
 	ret = sd_bus_send(NULL, reply, NULL);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
+unref_reply:
 	sd_bus_message_unref(reply);
-	return 0;
+destroy_request:
+	xdpw_request_destroy(req);
+	return ret;
 }
 
 static bool spawn_chooser(int chooser_out[2]) {
@@ -160,7 +162,7 @@ static bool spawn_chooser(int chooser_out[2]) {
 		dup2(chooser_out[1], STDOUT_FILENO);
 		close(chooser_out[1]);
 
-		execl("/bin/sh", "/bin/sh", "-c", "grim -g \"$(slurp -p)\" -t ppm -", NULL);
+		execl("/bin/sh", "/bin/sh", "-c", "grim -s 1 -g \"$(slurp -p)\" -t ppm -", NULL);
 
 		perror("execl");
 		_exit(127);
@@ -255,7 +257,8 @@ static int method_pick_color(sd_bus_message *msg, void *data,
 
 	struct xdpw_ppm_pixel pixel = {0};
 	if (!exec_color_picker(&pixel)) {
-		return -1;
+		ret = -1;
+		goto destroy_request;
 	}
 
 	double red = pixel.red / (pixel.max_color_value * 1.0);
@@ -265,21 +268,24 @@ static int method_pick_color(sd_bus_message *msg, void *data,
 	sd_bus_message *reply = NULL;
 	ret = sd_bus_message_new_method_return(msg, &reply);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
 	ret = sd_bus_message_append(reply, "ua{sv}", PORTAL_RESPONSE_SUCCESS, 1, "color", "(ddd)", red, green, blue);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
 	ret = sd_bus_send(NULL, reply, NULL);
 	if (ret < 0) {
-		return ret;
+		goto unref_reply;
 	}
 
+unref_reply:
 	sd_bus_message_unref(reply);
-	return 0;
+destroy_request:
+	xdpw_request_destroy(req);
+	return ret;
 }
 
 static const sd_bus_vtable screenshot_vtable[] = {

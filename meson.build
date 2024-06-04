@@ -13,12 +13,14 @@ add_project_arguments(cc.get_supported_arguments([
 	'-Wno-missing-braces',
 	'-Wno-missing-field-initializers',
 	'-Wno-unused-parameter',
-	'-D_POSIX_C_SOURCE=200809L',
 ]), language: 'c')
 
 prefix = get_option('prefix')
 sysconfdir = get_option('sysconfdir')
-add_project_arguments('-DSYSCONFDIR="@0@"'.format(prefix / sysconfdir), language : 'c')
+add_project_arguments([
+	'-D_POSIX_C_SOURCE=200809L',
+	'-DSYSCONFDIR="@0@"'.format(prefix / sysconfdir),
+], language: 'c')
 
 inc = include_directories('include')
 
@@ -57,6 +59,7 @@ xdpw_files = files([
 	'src/screencast/screencast.c',
 	'src/screencast/screencast_common.c',
 	'src/screencast/wlr_screencast.c',
+	'src/screencast/wlr_screencopy.c',
 	'src/screencast/pipewire_screencast.c',
 	'src/screencast/fps_limit.c',
     'src/filechooser/filechooser.c',
@@ -133,3 +136,9 @@ if scdoc.found()
 		)
 	endforeach
 endif
+
+summary({
+	'sd-bus provider': sdbus.name(),
+	'systemd service': systemd.found(),
+	'Man pages': scdoc.found(),
+}, bool_yn: true)
