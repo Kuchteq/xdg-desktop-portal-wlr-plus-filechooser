@@ -54,7 +54,7 @@ static int exec_filechooser(void *data, bool writing, bool multiple,
   }
 
   size_t num_lines = 0;
-  char cr;
+  signed char cr;
   do {
     cr = getc(fp);
     if (cr == '\n') {
@@ -430,3 +430,4 @@ int xdpw_filechooser_init(struct xdpw_state *state) {
   return sd_bus_add_object_vtable(state->bus, &slot, object_path,
                                   interface_name, filechooser_vtable, state);
 }
+
