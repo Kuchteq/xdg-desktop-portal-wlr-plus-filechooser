@@ -3,7 +3,7 @@
 # Contributor: Stefan Tatschner <stefan@rumpelsepp.org>
 
 pkgname=xdg-desktop-portal-wlr-plus-filechooser
-pkgver=0.7.1
+pkgver=0.8.2
 pkgrel=1
 pkgdesc='xdg-desktop-portal backend for wlroots'
 url="https://github.com/emersion/xdg-desktop-portal-wlr"
