@@ -58,19 +58,27 @@ void xdpw_screencast_instance_init(struct xdpw_screencast_context *ctx,
 		}
 	}
 
+	xdpw_buffer_constraints_init(&cast->current_constraints);
+	xdpw_buffer_constraints_init(&cast->pending_constraints);
+
+	uint32_t output_framerate = 0;
+	if (target->type == MONITOR) {
+		output_framerate = target->output->framerate;
+	}
+
 	cast->ctx = ctx;
 	cast->target = target;
 	if (ctx->state->config->screencast_conf.max_fps > 0) {
-		cast->max_framerate = ctx->state->config->screencast_conf.max_fps < (uint32_t)target->output->framerate ?
-			ctx->state->config->screencast_conf.max_fps : (uint32_t)target->output->framerate;
+		cast->max_framerate = output_framerate == 0 || ctx->state->config->screencast_conf.max_fps < output_framerate ?
+			ctx->state->config->screencast_conf.max_fps : output_framerate;
 	} else {
-		cast->max_framerate = (uint32_t)target->output->framerate;
+		cast->max_framerate = output_framerate;
 	}
 	cast->framerate = cast->max_framerate;
 	cast->refcount = 1;
 	cast->node_id = SPA_ID_INVALID;
 	cast->avoid_dmabufs = false;
-	cast->teardown = false;
+	wl_array_init(&cast->current_frame.damage);
 	wl_list_init(&cast->buffer_list);
 	logprint(INFO, "xdpw: screencast instance %p has %d references", cast, cast->refcount);
 	wl_list_insert(&ctx->screencast_instances, &cast->link);
@@ -79,6 +87,25 @@ void xdpw_screencast_instance_init(struct xdpw_screencast_context *ctx,
 }
 
 void xdpw_screencast_instance_destroy(struct xdpw_screencast_instance *cast) {
+	struct xdpw_timer *timer, *ttmp;
+	wl_list_for_each_safe(timer, ttmp, &cast->ctx->state->timers, link) {
+		if (timer->user_data == cast) {
+			xdpw_destroy_timer(timer);
+		}
+	}
+	struct xdpw_session *sess, *stmp;
+	wl_list_for_each_safe(sess, stmp, &cast->ctx->state->xdpw_sessions, link) {
+		if (sess->screencast_data.screencast_instance == cast) {
+			wl_list_remove(&sess->link);
+			wl_list_init(&sess->link);
+			sess->screencast_data.screencast_instance = NULL;
+			cast->refcount--;
+			xdpw_session_destroy(sess);
+		}
+	}
+
+	xdpw_wlr_session_close(cast);
+
 	assert(cast->refcount == 0); // Fails assert if called by screencast_finish
 	logprint(DEBUG, "xdpw: destroying cast instance");
 
@@ -95,25 +122,35 @@ void xdpw_screencast_instance_destroy(struct xdpw_screencast_instance *cast) {
 	wl_list_remove(&cast->link);
 	xdpw_pwr_stream_destroy(cast);
 	assert(wl_list_length(&cast->buffer_list) == 0);
+	wl_array_release(&cast->current_frame.damage);
+
+	xdpw_buffer_constraints_finish(&cast->current_constraints);
+	xdpw_buffer_constraints_finish(&cast->pending_constraints);
 	free(cast);
 }
 
-void xdpw_screencast_instance_teardown(struct xdpw_screencast_instance *cast) {
-	struct xdpw_session *sess, *tmp;
-	wl_list_for_each_safe(sess, tmp, &cast->ctx->state->xdpw_sessions, link) {
-		if (sess->screencast_data.screencast_instance == cast) {
-			xdpw_session_destroy(sess);
-		}
-	}
-}
-
-bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess, struct xdpw_screencast_restore_data *data) {
+bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess, struct xdpw_screencast_restore_data *data, uint32_t type_mask) {
 	bool target_initialized = false;
 
-	struct xdpw_wlr_output *output, *tmp_o;
-	wl_list_for_each_reverse_safe(output, tmp_o, &ctx->output_list, link) {
-		logprint(INFO, "wlroots: capturable output: %s model: %s: id: %i name: %s",
-			output->make, output->model, output->id, output->name);
+	type_mask &= ctx->state->screencast_source_types;
+	if (type_mask == 0) {
+		logprint(ERROR, "wlroots: No supported targets specified");
+		return false;
+	}
+
+	if (type_mask & MONITOR) {
+		struct xdpw_wlr_output *output;
+		wl_list_for_each(output, &ctx->output_list, link) {
+			logprint(INFO, "wlroots: capturable output: %i %s",
+				output->id, output->name);
+		}
+	}
+	if (type_mask & WINDOW) {
+		struct xdpw_toplevel *toplevel;
+		wl_list_for_each(toplevel, &ctx->toplevels, link) {
+			logprint(INFO, "wlroots: capturable toplevel: %s app_id: %s title: %s",
+				toplevel->identifier, toplevel->app_id, toplevel->title);
+		}
 	}
 
 	struct xdpw_screencast_target *target = calloc(1, sizeof(struct xdpw_screencast_target));
@@ -126,7 +163,7 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		target_initialized = xdpw_wlr_target_from_data(ctx, target, data);
 	}
 	if (!target_initialized) {
-		target_initialized = xdpw_wlr_target_chooser(ctx, target);
+		target_initialized = xdpw_wlr_target_chooser(ctx, target, type_mask);
 		//TODO: Chooser option to confirm the persist mode
 		const char *env_persist_str = getenv("XDPW_PERSIST_MODE");
 		if (env_persist_str) {
@@ -149,7 +186,7 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		free(target);
 		return false;
 	}
-	assert(target->output);
+	assert(target->output || target->toplevel);
 
 	// Disable screencast sharing to avoid sharing between dmabuf and shm capable clients
 	/*
@@ -179,8 +216,15 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		sess->screencast_data.screencast_instance = calloc(1, sizeof(struct xdpw_screencast_instance));
 		xdpw_screencast_instance_init(ctx, sess->screencast_data.screencast_instance, target);
 	}
-	logprint(INFO, "wlroots: output: %s",
-		sess->screencast_data.screencast_instance->target->output->name);
+
+	switch (sess->screencast_data.screencast_instance->target->type) {
+	case MONITOR:
+		logprint(INFO, "wlroots: output: %s", sess->screencast_data.screencast_instance->target->output->name);
+		break;
+	case WINDOW:
+		logprint(INFO, "wlroots: toplevel: %s", sess->screencast_data.screencast_instance->target->toplevel->title);
+		break;
+	}
 
 	return true;
 
@@ -327,6 +371,7 @@ static int method_screencast_select_sources(sd_bus_message *msg, void *data,
 
 	char *key;
 	int innerRet = 0;
+	uint32_t type_mask = 0;
 	struct xdpw_screencast_restore_data restore_data = {0};
 	while ((ret = sd_bus_message_enter_container(msg, 'e', "sv")) > 0) {
 		innerRet = sd_bus_message_read(msg, "s", &key);
@@ -339,13 +384,12 @@ static int method_screencast_select_sources(sd_bus_message *msg, void *data,
 			sd_bus_message_read(msg, "v", "b", &multiple);
 			logprint(INFO, "dbus: option multiple: %d", multiple);
 		} else if (strcmp(key, "types") == 0) {
-			uint32_t mask;
-			sd_bus_message_read(msg, "v", "u", &mask);
-			if (!(mask & MONITOR)) {
-				logprint(INFO, "dbus: non-monitor cast requested, not replying");
+			sd_bus_message_read(msg, "v", "u", &type_mask);
+			if (!(type_mask & (MONITOR | WINDOW))) {
+				logprint(INFO, "dbus: non-monitor non-window cast requested, not replying");
 				return -1;
 			}
-			logprint(INFO, "dbus: option types:%x", mask);
+			logprint(INFO, "dbus: option types: %x", type_mask);
 		} else if (strcmp(key, "cursor_mode") == 0) {
 			sd_bus_message_read(msg, "v", "u", &sess->screencast_data.cursor_mode);
 			if (sess->screencast_data.cursor_mode & METADATA) {
@@ -446,13 +490,13 @@ static int method_screencast_select_sources(sd_bus_message *msg, void *data,
 		return ret;
 	}
 
-	bool output_selection_canceled = !setup_target(ctx, sess, restore_data.version > 0 ? &restore_data : NULL);
+	bool selection_canceled = !setup_target(ctx, sess, restore_data.version > 0 ? &restore_data : NULL, type_mask);
 
 	ret = sd_bus_message_new_method_return(msg, &reply);
 	if (ret < 0) {
 		return ret;
 	}
-	if (output_selection_canceled) {
+	if (selection_canceled) {
 		ret = sd_bus_message_append(reply, "ua{sv}", PORTAL_RESPONSE_CANCELLED, 0);
 	} else {
 		ret = sd_bus_message_append(reply, "ua{sv}", PORTAL_RESPONSE_SUCCESS, 0);
@@ -603,7 +647,7 @@ static int method_screencast_start(sd_bus_message *msg, void *data,
 	if (ret < 0) {
 		return ret;
 	}
-	if (cast->target->output->xdg_output) {
+	if (cast->target->output && cast->target->output->xdg_output) {
 		ret = sd_bus_message_append(reply, "{sv}",
 			"position", "(ii)", cast->target->output->x, cast->target->output->y);
 		if (ret < 0) {
@@ -615,7 +659,7 @@ static int method_screencast_start(sd_bus_message *msg, void *data,
 			return ret;
 		}
 	}
-	ret = sd_bus_message_append(reply, "{sv}", "source_type", "u", MONITOR);
+	ret = sd_bus_message_append(reply, "{sv}", "source_type", "u", cast->target->type);
 	if (ret < 0) {
 		return ret;
 	}
@@ -644,7 +688,7 @@ static int method_screencast_start(sd_bus_message *msg, void *data,
 	if (ret < 0) {
 		return ret;
 	}
-	if (sess->screencast_data.persist_mode != PERSIST_NONE) {
+	if (sess->screencast_data.persist_mode != PERSIST_NONE && cast->target->output) {
 		struct xdpw_screencast_restore_data restore_data;
 		restore_data.output_name = cast->target->output->name;
 		ret = sd_bus_message_append(reply, "{sv}",

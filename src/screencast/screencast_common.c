@@ -40,6 +40,33 @@ struct gbm_device *xdpw_gbm_device_create(drmDevice *device) {
 	return gbm_create_device(fd);
 }
 
+void xdpw_gbm_device_update(struct xdpw_screencast_instance *cast) {
+	drmDevice *new_dev = NULL;
+	if (drmGetDeviceFromDevId(cast->current_constraints.dmabuf_device, 0, &new_dev) != 0) {
+		// No device or invalid device, nothing to do
+		return;
+	}
+
+	if (!cast->ctx->gbm) {
+		// Our first device
+		cast->ctx->gbm = xdpw_gbm_device_create(new_dev);
+		drmFreeDevice(&new_dev);
+		return;
+	}
+
+	drmDevice *old_dev = NULL;
+	int fd = gbm_device_get_fd(cast->ctx->gbm);
+	if (drmGetDevice(fd, &old_dev) != 0 || !drmDevicesEqual(new_dev, old_dev)) {
+		// We either couldn't identify the old device or they didn't match, recreate
+		gbm_device_destroy(cast->ctx->gbm);
+		close(fd);
+		cast->ctx->gbm = xdpw_gbm_device_create(new_dev);
+	}
+
+	drmFreeDevice(&old_dev);
+	drmFreeDevice(&new_dev);
+}
+
 static int anonymous_shm_open(void) {
 	char name[] = "/xdpw-shm-XXXXXX";
 	int retries = 100;
@@ -77,35 +104,54 @@ static struct wl_buffer *import_wl_shm_buffer(struct xdpw_screencast_instance *c
 }
 
 struct xdpw_buffer *xdpw_buffer_create(struct xdpw_screencast_instance *cast,
-		enum buffer_type buffer_type, struct xdpw_screencopy_frame_info *frame_info) {
+		enum buffer_type buffer_type) {
 	struct xdpw_buffer *buffer = calloc(1, sizeof(struct xdpw_buffer));
-	buffer->width = frame_info->width;
-	buffer->height = frame_info->height;
-	buffer->format = frame_info->format;
+
+	uint32_t format = xdpw_format_drm_fourcc_from_pw_format(cast->pwr_format.format);
+	assert(format != DRM_FORMAT_INVALID);
+
+	buffer->width = cast->current_constraints.width;
+	buffer->height = cast->current_constraints.height;
 	buffer->buffer_type = buffer_type;
+	buffer->format = format;
+	wl_array_init(&buffer->damage);
 
 	switch (buffer_type) {
-	case WL_SHM:
+	case WL_SHM:;
+		struct xdpw_shm_format *fmt;
+		bool found = false;
+		wl_array_for_each(fmt, &cast->current_constraints.shm_formats) {
+			if (fmt->fourcc == format) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			logprint(ERROR, "xdpw: unable to find format: %d", format);
+			xdpw_buffer_destroy(buffer);
+			return NULL;
+
+		}
+
 		buffer->plane_count = 1;
-		buffer->size[0] = frame_info->size;
-		buffer->stride[0] = frame_info->stride;
+		buffer->size[0] = fmt->stride * buffer->height;
+		buffer->stride[0] = fmt->stride;
 		buffer->offset[0] = 0;
 		buffer->fd[0] = anonymous_shm_open();
 		if (buffer->fd[0] == -1) {
 			logprint(ERROR, "xdpw: unable to create anonymous filedescriptor");
-			free(buffer);
+			xdpw_buffer_destroy(buffer);
 			return NULL;
 		}
 
 		if (ftruncate(buffer->fd[0], buffer->size[0]) < 0) {
 			logprint(ERROR, "xdpw: unable to truncate filedescriptor");
-			close(buffer->fd[0]);
-			free(buffer);
+			xdpw_buffer_destroy(buffer);
 			return NULL;
 		}
 
-		buffer->buffer = import_wl_shm_buffer(cast, buffer->fd[0], xdpw_format_wl_shm_from_drm_fourcc(frame_info->format),
-			frame_info->width, frame_info->height, frame_info->stride);
+		buffer->buffer = import_wl_shm_buffer(cast, buffer->fd[0], xdpw_format_wl_shm_from_drm_fourcc(format),
+			buffer->width, buffer->height, fmt->stride);
 		if (buffer->buffer == NULL) {
 			logprint(ERROR, "xdpw: unable to create wl_buffer");
 			close(buffer->fd[0]);
@@ -114,74 +160,69 @@ struct xdpw_buffer *xdpw_buffer_create(struct xdpw_screencast_instance *cast,
 		}
 		break;
 	case DMABUF:;
+		struct gbm_bo *bo;
 		uint32_t flags = GBM_BO_USE_RENDERING;
 		if (cast->pwr_format.modifier != DRM_FORMAT_MOD_INVALID) {
 			uint64_t *modifiers = (uint64_t*)&cast->pwr_format.modifier;
-			buffer->bo = gbm_bo_create_with_modifiers2(cast->ctx->gbm, frame_info->width, frame_info->height,
-				frame_info->format, modifiers, 1, flags);
+			bo = gbm_bo_create_with_modifiers2(cast->ctx->gbm, buffer->width, buffer->height,
+				format, modifiers, 1, flags);
 		} else {
 			if (cast->ctx->state->config->screencast_conf.force_mod_linear) {
 				flags |= GBM_BO_USE_LINEAR;
 			}
-			buffer->bo = gbm_bo_create(cast->ctx->gbm, frame_info->width, frame_info->height,
-				frame_info->format, flags);
+			bo = gbm_bo_create(cast->ctx->gbm, buffer->width, buffer->height, format, flags);
 		}
 
 		// Fallback for linear buffers via the implicit api
-		if (buffer->bo == NULL && cast->pwr_format.modifier == DRM_FORMAT_MOD_LINEAR) {
-			buffer->bo = gbm_bo_create(cast->ctx->gbm, frame_info->width, frame_info->height,
-					frame_info->format, flags | GBM_BO_USE_LINEAR);
+		if (bo == NULL && cast->pwr_format.modifier == DRM_FORMAT_MOD_LINEAR) {
+			bo = gbm_bo_create(cast->ctx->gbm, buffer->width, buffer->height,
+				format, flags | GBM_BO_USE_LINEAR);
 		}
 
-		if (buffer->bo == NULL) {
+		if (bo == NULL) {
 			logprint(ERROR, "xdpw: failed to create gbm_bo");
-			free(buffer);
+			xdpw_buffer_destroy(buffer);
 			return NULL;
 		}
-		buffer->plane_count = gbm_bo_get_plane_count(buffer->bo);
+		buffer->plane_count = gbm_bo_get_plane_count(bo);
 
 		struct zwp_linux_buffer_params_v1 *params;
 		params = zwp_linux_dmabuf_v1_create_params(cast->ctx->linux_dmabuf);
 		if (!params) {
 			logprint(ERROR, "xdpw: failed to create linux_buffer_params");
-			gbm_bo_destroy(buffer->bo);
-			free(buffer);
+			gbm_bo_destroy(bo);
+			xdpw_buffer_destroy(buffer);
 			return NULL;
 		}
 
+		buffer->modifier = gbm_bo_get_modifier(bo);
 		for (int plane = 0; plane < buffer->plane_count; plane++) {
 			buffer->size[plane] = 0;
-			buffer->stride[plane] = gbm_bo_get_stride_for_plane(buffer->bo, plane);
-			buffer->offset[plane] = gbm_bo_get_offset(buffer->bo, plane);
-			uint64_t mod = gbm_bo_get_modifier(buffer->bo);
-			buffer->fd[plane] = gbm_bo_get_fd_for_plane(buffer->bo, plane);
+			buffer->stride[plane] = gbm_bo_get_stride_for_plane(bo, plane);
+			buffer->offset[plane] = gbm_bo_get_offset(bo, plane);
+			buffer->fd[plane] = gbm_bo_get_fd_for_plane(bo, plane);
 
 			if (buffer->fd[plane] < 0) {
 				logprint(ERROR, "xdpw: failed to get file descriptor");
 				zwp_linux_buffer_params_v1_destroy(params);
-				gbm_bo_destroy(buffer->bo);
-				for (int plane_tmp = 0; plane_tmp < plane; plane_tmp++) {
-					close(buffer->fd[plane_tmp]);
-				}
-				free(buffer);
+				gbm_bo_destroy(bo);
+				xdpw_buffer_destroy(buffer);
 				return NULL;
 			}
 
 			zwp_linux_buffer_params_v1_add(params, buffer->fd[plane], plane,
-				buffer->offset[plane], buffer->stride[plane], mod >> 32, mod & 0xffffffff);
+				buffer->offset[plane], buffer->stride[plane], buffer->modifier >> 32,
+				buffer->modifier & 0xffffffff);
 		}
 		buffer->buffer = zwp_linux_buffer_params_v1_create_immed(params,
 			buffer->width, buffer->height,
 			buffer->format, /* flags */ 0);
 		zwp_linux_buffer_params_v1_destroy(params);
+		gbm_bo_destroy(bo);
 
 		if (!buffer->buffer) {
 			logprint(ERROR, "xdpw: failed to create buffer");
-			gbm_bo_destroy(buffer->bo);
-			for (int plane = 0; plane < buffer->plane_count; plane++) {
-				close(buffer->fd[plane]);
-			}
-			free(buffer);
+			xdpw_buffer_destroy(buffer);
 			return NULL;
 		}
 	}
@@ -190,46 +231,14 @@ struct xdpw_buffer *xdpw_buffer_create(struct xdpw_screencast_instance *cast,
 }
 
 void xdpw_buffer_destroy(struct xdpw_buffer *buffer) {
-	wl_buffer_destroy(buffer->buffer);
-	if (buffer->buffer_type == DMABUF) {
-		gbm_bo_destroy(buffer->bo);
+	if (buffer->buffer) {
+		wl_buffer_destroy(buffer->buffer);
 	}
 	for (int plane = 0; plane < buffer->plane_count; plane++) {
 		close(buffer->fd[plane]);
 	}
-	wl_list_remove(&buffer->link);
+	wl_array_release(&buffer->damage);
 	free(buffer);
-}
-
-bool wlr_query_dmabuf_modifiers(struct xdpw_screencast_context *ctx, uint32_t drm_format,
-		uint32_t num_modifiers, uint64_t *modifiers, uint32_t *max_modifiers) {
-	if (ctx->format_modifier_pairs.size == 0)
-		return false;
-	struct xdpw_format_modifier_pair *fm_pair;
-	if (num_modifiers == 0) {
-		*max_modifiers = 0;
-		wl_array_for_each(fm_pair, &ctx->format_modifier_pairs) {
-			if (fm_pair->fourcc == drm_format &&
-					(fm_pair->modifier == DRM_FORMAT_MOD_INVALID ||
-					gbm_device_get_format_modifier_plane_count(ctx->gbm, fm_pair->fourcc, fm_pair->modifier) > 0))
-				*max_modifiers += 1;
-		}
-		return true;
-	}
-
-	uint32_t i = 0;
-	wl_array_for_each(fm_pair, &ctx->format_modifier_pairs) {
-		if (i == num_modifiers)
-			break;
-		if (fm_pair->fourcc == drm_format &&
-				(fm_pair->modifier == DRM_FORMAT_MOD_INVALID ||
-				gbm_device_get_format_modifier_plane_count(ctx->gbm, fm_pair->fourcc, fm_pair->modifier) > 0)) {
-			modifiers[i] = fm_pair->modifier;
-			i++;
-		}
-	}
-	*max_modifiers = num_modifiers;
-	return true;
 }
 
 enum wl_shm_format xdpw_format_wl_shm_from_drm_fourcc(uint32_t format) {
@@ -295,9 +304,79 @@ enum spa_video_format xdpw_format_pw_from_drm_fourcc(uint32_t format) {
 	case DRM_FORMAT_RGB888:
 		return SPA_VIDEO_FORMAT_BGR;
 	default:
-		logprint(ERROR, "xdg-desktop-portal-wlr: failed to convert drm "
-			"format 0x%08x to spa_video_format", format);
-		abort();
+		return SPA_VIDEO_FORMAT_UNKNOWN;
+	}
+}
+
+int xdpw_bpp_from_drm_fourcc(uint32_t format) {
+	switch (format) {
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_BGRA8888:
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_XRGB2101010:
+	case DRM_FORMAT_XBGR2101010:
+	case DRM_FORMAT_RGBX1010102:
+	case DRM_FORMAT_BGRX1010102:
+	case DRM_FORMAT_ARGB2101010:
+	case DRM_FORMAT_ABGR2101010:
+	case DRM_FORMAT_RGBA1010102:
+	case DRM_FORMAT_BGRA1010102:
+		return 4;
+	case DRM_FORMAT_BGR888:
+	case DRM_FORMAT_RGB888:
+		return 3;
+	default:
+		return -1;
+	}
+}
+
+uint32_t xdpw_format_drm_fourcc_from_pw_format(enum spa_video_format format) {
+	switch (format) {
+	case SPA_VIDEO_FORMAT_BGRA:
+		return DRM_FORMAT_ARGB8888;
+	case SPA_VIDEO_FORMAT_BGRx:
+		return DRM_FORMAT_XRGB8888;
+	case SPA_VIDEO_FORMAT_ABGR:
+		return DRM_FORMAT_RGBA8888;
+	case SPA_VIDEO_FORMAT_xBGR:
+		return DRM_FORMAT_RGBX8888;
+	case SPA_VIDEO_FORMAT_RGBA:
+		return DRM_FORMAT_ABGR8888;
+	case SPA_VIDEO_FORMAT_RGBx:
+		return DRM_FORMAT_XBGR8888;
+	case SPA_VIDEO_FORMAT_ARGB:
+		return DRM_FORMAT_BGRA8888;
+	case SPA_VIDEO_FORMAT_xRGB:
+		return DRM_FORMAT_BGRX8888;
+	case SPA_VIDEO_FORMAT_NV12:
+		return DRM_FORMAT_NV12;
+	case SPA_VIDEO_FORMAT_xRGB_210LE:
+		return DRM_FORMAT_XRGB2101010;
+	case SPA_VIDEO_FORMAT_xBGR_210LE:
+		return DRM_FORMAT_XBGR2101010;
+	case SPA_VIDEO_FORMAT_RGBx_102LE:
+		return DRM_FORMAT_RGBX1010102;
+	case SPA_VIDEO_FORMAT_BGRx_102LE:
+		return DRM_FORMAT_BGRX1010102;
+	case SPA_VIDEO_FORMAT_ARGB_210LE:
+		return DRM_FORMAT_ARGB2101010;
+	case SPA_VIDEO_FORMAT_ABGR_210LE:
+		return DRM_FORMAT_ABGR2101010;
+	case SPA_VIDEO_FORMAT_RGBA_102LE:
+		return DRM_FORMAT_RGBA1010102;
+	case SPA_VIDEO_FORMAT_BGRA_102LE:
+		return DRM_FORMAT_BGRA1010102;
+	case SPA_VIDEO_FORMAT_RGB:
+		return DRM_FORMAT_BGR888;
+	case SPA_VIDEO_FORMAT_BGR:
+		return DRM_FORMAT_RGB888;
+	default:
+		return DRM_FORMAT_INVALID;
 	}
 }
 
@@ -366,3 +445,59 @@ struct xdpw_frame_damage merge_damage(struct xdpw_frame_damage *damage1, struct 
 
 	return damage;
 }
+
+void xdpw_buffer_constraints_init(struct xdpw_buffer_constraints *constraints) {
+	*constraints = (struct xdpw_buffer_constraints){ 0 };
+	wl_array_init(&constraints->dmabuf_format_modifier_pairs);
+	wl_array_init(&constraints->shm_formats);
+}
+
+void xdpw_buffer_constraints_finish(struct xdpw_buffer_constraints *constraints) {
+	wl_array_release(&constraints->dmabuf_format_modifier_pairs);
+	wl_array_release(&constraints->shm_formats);
+	*constraints = (struct xdpw_buffer_constraints){ 0 };
+}
+
+bool xdpw_buffer_constraints_move(struct xdpw_buffer_constraints *dst, struct xdpw_buffer_constraints *src) {
+	if (!src->dirty) {
+		return false;
+	}
+	int dirty = src->dirty;
+
+	xdpw_buffer_constraints_finish(dst);
+	*dst = *src;
+
+	xdpw_buffer_constraints_init(src);
+	return dirty;
+}
+
+uint32_t xdpw_count_dmabuf_modifiers(struct xdpw_screencast_instance *cast, uint32_t drm_format) {
+	struct xdpw_buffer_constraints *constraints = &cast->current_constraints;
+	uint32_t modifiers = 0;
+	struct xdpw_format_modifier_pair *fm_pair;
+	wl_array_for_each(fm_pair, &constraints->dmabuf_format_modifier_pairs) {
+		if (fm_pair->fourcc == drm_format &&
+				(fm_pair->modifier == DRM_FORMAT_MOD_INVALID ||
+				gbm_device_get_format_modifier_plane_count(cast->ctx->gbm, fm_pair->fourcc, fm_pair->modifier) > 0))
+			modifiers += 1;
+	}
+
+	return modifiers;
+}
+
+void xdpw_query_dmabuf_modifiers(struct xdpw_screencast_instance *cast, uint32_t drm_format,
+		uint64_t *modifiers, uint32_t num_modifiers) {
+	struct xdpw_buffer_constraints *constraints = &cast->current_constraints;
+	uint32_t idx = 0;
+	struct xdpw_format_modifier_pair *fm_pair;
+	wl_array_for_each(fm_pair, &constraints->dmabuf_format_modifier_pairs) {
+		if (fm_pair->fourcc == drm_format &&
+				(fm_pair->modifier == DRM_FORMAT_MOD_INVALID ||
+				gbm_device_get_format_modifier_plane_count(cast->ctx->gbm, fm_pair->fourcc, fm_pair->modifier) > 0)) {
+			assert(idx < num_modifiers);
+			modifiers[idx] = fm_pair->modifier;
+			idx++;
+		}
+	}
+}
+

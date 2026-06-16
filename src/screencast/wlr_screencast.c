@@ -3,6 +3,9 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include "ext-image-capture-source-v1-client-protocol.h"
+#include "ext-image-copy-capture-v1-client-protocol.h"
+#include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include <drm_fourcc.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -12,31 +15,54 @@
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <assert.h>
 #include <wayland-client-protocol.h>
 #include <xf86drm.h>
 
 #include "screencast.h"
 #include "wlr_screencopy.h"
+#include "ext_image_copy.h"
 #include "xdpw.h"
 #include "logger.h"
+#include "fps_limit.h"
 
-void xdpw_wlr_frame_capture(struct xdpw_screencast_instance *cast) {
-	if (cast->ctx->screencopy_manager) {
+static void wlr_frame_capture_start(struct xdpw_screencast_instance *cast) {
+	fps_limit_measure_start(&cast->fps_limit, cast->framerate);
+	if (cast->ctx->ext_image_copy_capture_manager
+			&& cast->ctx->ext_output_image_capture_source_manager) {
+		xdpw_ext_ic_frame_capture(cast);
+	} else if (cast->ctx->screencopy_manager) {
 		xdpw_wlr_sc_frame_capture(cast);
 	}
 }
 
+static void wlr_frame_capture_timer(void *data) {
+	wlr_frame_capture_start((struct xdpw_screencast_instance *)data);
+}
+
+void xdpw_wlr_frame_capture(struct xdpw_screencast_instance *cast) {
+	uint64_t delay_ns = fps_limit_measure_end(&cast->fps_limit, cast->framerate);
+	if (delay_ns > 0) {
+		xdpw_add_timer(cast->ctx->state, delay_ns, wlr_frame_capture_timer, cast);
+	} else {
+		wlr_frame_capture_start(cast);
+	}
+}
+
 void xdpw_wlr_session_close(struct xdpw_screencast_instance *cast) {
-	if (cast->ctx->screencopy_manager) {
+	if (cast->ctx->ext_image_copy_capture_manager
+			&& cast->ctx->ext_output_image_capture_source_manager) {
+		xdpw_ext_ic_session_close(cast);
+	} else if (cast->ctx->screencopy_manager) {
 		xdpw_wlr_sc_session_close(cast);
 	}
 }
 
 int xdpw_wlr_session_init(struct xdpw_screencast_instance *cast) {
-	if (cast->ctx->screencopy_manager) {
+	if (cast->ctx->ext_image_copy_capture_manager
+			&& cast->ctx->ext_output_image_capture_source_manager) {
+		return xdpw_ext_ic_session_init(cast);
+	} else if (cast->ctx->screencopy_manager) {
 		return xdpw_wlr_sc_session_init(cast);
 	}
 	return -1;
@@ -46,8 +72,6 @@ static void wlr_output_handle_geometry(void *data, struct wl_output *wl_output,
 		int32_t x, int32_t y, int32_t phys_width, int32_t phys_height,
 		int32_t subpixel, const char *make, const char *model, int32_t transform) {
 	struct xdpw_wlr_output *output = data;
-	output->make = strdup(make);
-	output->model = strdup(model);
 	output->transformation = transform;
 }
 
@@ -76,7 +100,9 @@ static void wlr_output_handle_name(void *data, struct wl_output *wl_output,
 
 static void wlr_output_handle_description(void *data, struct wl_output *wl_output,
 		const char *description) {
-	/* Nothing to do */
+	struct xdpw_wlr_output *output = data;
+	free(output->description);
+	output->description = strdup(description);
 }
 
 static const struct wl_output_listener wlr_output_listener = {
@@ -124,16 +150,7 @@ static const struct zxdg_output_v1_listener xdg_output_listener = {
 	.description = xdg_output_handle_description,
 };
 
-static struct xdpw_wlr_output *xdpw_wlr_output_first(struct wl_list *output_list) {
-	struct xdpw_wlr_output *output, *tmp;
-	wl_list_for_each_safe(output, tmp, output_list, link) {
-		return output;
-	}
-	return NULL;
-}
-
-static struct xdpw_wlr_output *xdpw_wlr_output_find_by_name(struct wl_list *output_list,
-		const char *name) {
+struct xdpw_wlr_output *xdpw_wlr_output_find_by_name(struct wl_list *output_list, const char *name) {
 	struct xdpw_wlr_output *output, *tmp;
 	wl_list_for_each_safe(output, tmp, output_list, link) {
 		if (strcmp(output->name, name) == 0) {
@@ -154,209 +171,6 @@ static struct xdpw_wlr_output *xdpw_wlr_output_find(struct xdpw_screencast_conte
 	return NULL;
 }
 
-static pid_t spawn_chooser(char *cmd, int chooser_in[2], int chooser_out[2]) {
-	logprint(TRACE,
-			"exec chooser called: cmd %s, pipe chooser_in (%d,%d), pipe chooser_out (%d,%d)",
-			cmd, chooser_in[0], chooser_in[1], chooser_out[0], chooser_out[1]);
-	pid_t pid = fork();
-
-	if (pid < 0) {
-		perror("fork");
-		return pid;
-	} else if (pid == 0) {
-		close(chooser_in[1]);
-		close(chooser_out[0]);
-
-		dup2(chooser_in[0], STDIN_FILENO);
-		dup2(chooser_out[1], STDOUT_FILENO);
-		close(chooser_in[0]);
-		close(chooser_out[1]);
-
-		execl("/bin/sh", "/bin/sh", "-c", cmd, NULL);
-
-		perror("execl");
-		_exit(127);
-	}
-
-	close(chooser_in[0]);
-	close(chooser_out[1]);
-
-	return pid;
-}
-
-static bool wait_chooser(pid_t pid) {
-	int status;
-	if (waitpid(pid ,&status, 0) != -1 && WIFEXITED(status)) {
-		return WEXITSTATUS(status) != 127;
-	}
-	return false;
-}
-
-static bool wlr_output_chooser(struct xdpw_output_chooser *chooser,
-		struct wl_list *output_list, struct xdpw_wlr_output **output) {
-	logprint(DEBUG, "wlroots: output chooser called");
-	struct xdpw_wlr_output *out;
-	size_t name_size = 0;
-	char *name = NULL;
-	*output = NULL;
-
-	int chooser_in[2]; //p -> c
-	int chooser_out[2]; //c -> p
-
-	if (pipe(chooser_in) == -1) {
-		perror("pipe chooser_in");
-		logprint(ERROR, "Failed to open pipe chooser_in");
-		goto error_chooser_in;
-	}
-	if (pipe(chooser_out) == -1) {
-		perror("pipe chooser_out");
-		logprint(ERROR, "Failed to open pipe chooser_out");
-		goto error_chooser_out;
-	}
-
-	pid_t pid = spawn_chooser(chooser->cmd, chooser_in, chooser_out);
-	if (pid < 0) {
-		logprint(ERROR, "Failed to fork chooser");
-		goto error_fork;
-	}
-
-	switch (chooser->type) {
-	case XDPW_CHOOSER_DMENU:;
-		FILE *f = fdopen(chooser_in[1], "w");
-		if (f == NULL) {
-			perror("fdopen pipe chooser_in");
-			logprint(ERROR, "Failed to create stream writing to pipe chooser_in");
-			goto error_fork;
-		}
-		wl_list_for_each(out, output_list, link) {
-			fprintf(f, "%s\n", out->name);
-		}
-		fclose(f);
-		break;
-	default:
-		close(chooser_in[1]);
-	}
-
-	if (!wait_chooser(pid)) {
-		close(chooser_out[0]);
-		return false;
-	}
-
-	FILE *f = fdopen(chooser_out[0], "r");
-	if (f == NULL) {
-		perror("fdopen pipe chooser_out");
-		logprint(ERROR, "Failed to create stream reading from pipe chooser_out");
-		close(chooser_out[0]);
-		goto end;
-	}
-
-	ssize_t nread = getline(&name, &name_size, f);
-	fclose(f);
-	if (nread < 0) {
-		perror("getline failed");
-		goto end;
-	}
-
-	//Strip newline
-	char *p = strchr(name, '\n');
-	if (p != NULL) {
-		*p = '\0';
-	}
-
-	logprint(TRACE, "wlroots: output chooser %s selects output %s", chooser->cmd, name);
-	wl_list_for_each(out, output_list, link) {
-		if (strcmp(out->name, name) == 0) {
-			*output = out;
-			break;
-		}
-	}
-	free(name);
-
-end:
-	return true;
-
-error_fork:
-	close(chooser_out[0]);
-	close(chooser_out[1]);
-error_chooser_out:
-	close(chooser_in[0]);
-	close(chooser_in[1]);
-error_chooser_in:
-	*output = NULL;
-	return false;
-}
-
-static struct xdpw_wlr_output *wlr_output_chooser_default(struct wl_list *output_list) {
-	logprint(DEBUG, "wlroots: output chooser called");
-	struct xdpw_output_chooser default_chooser[] = {
-		{XDPW_CHOOSER_SIMPLE, "slurp -f %o -or"},
-		{XDPW_CHOOSER_DMENU, "wofi -d -n --prompt='Select the monitor to share:'"},
-		{XDPW_CHOOSER_DMENU, "bemenu --prompt='Select the monitor to share:'"},
-	};
-
-	size_t N = sizeof(default_chooser)/sizeof(default_chooser[0]);
-	struct xdpw_wlr_output *output = NULL;
-	bool ret;
-	for (size_t i = 0; i<N; i++) {
-		ret = wlr_output_chooser(&default_chooser[i], output_list, &output);
-		if (!ret) {
-			logprint(DEBUG, "wlroots: output chooser %s not found. Trying next one.",
-					default_chooser[i].cmd);
-			continue;
-		}
-		if (output != NULL) {
-			logprint(DEBUG, "wlroots: output chooser selects %s", output->name);
-		} else {
-			logprint(DEBUG, "wlroots: output chooser canceled");
-		}
-		return output;
-	}
-	return xdpw_wlr_output_first(output_list);
-}
-
-static struct xdpw_wlr_output *xdpw_wlr_output_chooser(struct xdpw_screencast_context *ctx) {
-	switch (ctx->state->config->screencast_conf.chooser_type) {
-	case XDPW_CHOOSER_DEFAULT:
-		return wlr_output_chooser_default(&ctx->output_list);
-	case XDPW_CHOOSER_NONE:
-		if (ctx->state->config->screencast_conf.output_name) {
-			return xdpw_wlr_output_find_by_name(&ctx->output_list, ctx->state->config->screencast_conf.output_name);
-		} else {
-			return xdpw_wlr_output_first(&ctx->output_list);
-		}
-	case XDPW_CHOOSER_DMENU:
-	case XDPW_CHOOSER_SIMPLE:;
-		struct xdpw_wlr_output *output = NULL;
-		if (!ctx->state->config->screencast_conf.chooser_cmd) {
-			logprint(ERROR, "wlroots: no output chooser given");
-			goto end;
-		}
-		struct xdpw_output_chooser chooser = {
-			ctx->state->config->screencast_conf.chooser_type,
-			ctx->state->config->screencast_conf.chooser_cmd
-		};
-		logprint(DEBUG, "wlroots: output chooser %s (%d)", chooser.cmd, chooser.type);
-		bool ret = wlr_output_chooser(&chooser, &ctx->output_list, &output);
-		if (!ret) {
-			logprint(ERROR, "wlroots: output chooser %s failed", chooser.cmd);
-			goto end;
-		}
-		if (output) {
-			logprint(DEBUG, "wlroots: output chooser selects %s", output->name);
-		} else {
-			logprint(DEBUG, "wlroots: output chooser canceled");
-		}
-		return output;
-	}
-end:
-	return NULL;
-}
-
-bool xdpw_wlr_target_chooser(struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target) {
-	target->output = xdpw_wlr_output_chooser(ctx);
-	return target->output != NULL;
-}
-
 bool xdpw_wlr_target_from_data(struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target,
 		struct xdpw_screencast_restore_data *data) {
 	struct xdpw_wlr_output *out = NULL;
@@ -365,14 +179,14 @@ bool xdpw_wlr_target_from_data(struct xdpw_screencast_context *ctx, struct xdpw_
 	if (!out) {
 		return false;
 	}
+	target->type = MONITOR;
 	target->output = out;
 	return true;
 }
 
 static void wlr_remove_output(struct xdpw_wlr_output *out) {
 	free(out->name);
-	free(out->make);
-	free(out->model);
+	free(out->description);
 	if (out->xdg_output) {
 		zxdg_output_v1_destroy(out->xdg_output);
 	}
@@ -546,6 +360,87 @@ static const struct zwp_linux_dmabuf_feedback_v1_listener linux_dmabuf_listener_
 	.tranche_done = linux_dmabuf_feedback_tranche_done,
 };
 
+static void foreign_toplevel_destroy(struct xdpw_toplevel *toplevel) {
+	wl_list_remove(&toplevel->link);
+	ext_foreign_toplevel_handle_v1_destroy(toplevel->handle);
+	free(toplevel->title);
+	free(toplevel->app_id);
+	free(toplevel->identifier);
+	free(toplevel);
+}
+
+static void foreign_toplevel_handle_closed(void *data,
+		struct ext_foreign_toplevel_handle_v1 *handle) {
+	struct xdpw_toplevel *toplevel = data;
+	foreign_toplevel_destroy(toplevel);
+}
+
+static void foreign_toplevel_handle_done(void *data,
+		struct ext_foreign_toplevel_handle_v1 *handle) {
+}
+
+static void foreign_toplevel_handle_title(void *data,
+		struct ext_foreign_toplevel_handle_v1 *handle, const char *title) {
+	struct xdpw_toplevel *toplevel = data;
+	free(toplevel->title);
+	toplevel->title = strdup(title);
+}
+
+static void foreign_toplevel_handle_app_id(void *data,
+		struct ext_foreign_toplevel_handle_v1 *handle, const char *app_id) {
+	struct xdpw_toplevel *toplevel = data;
+	free(toplevel->app_id);
+	toplevel->app_id = strdup(app_id);
+}
+
+static void foreign_toplevel_handle_identifier(void *data,
+		struct ext_foreign_toplevel_handle_v1 *handle, const char *identifier) {
+	struct xdpw_toplevel *toplevel = data;
+	free(toplevel->identifier);
+	toplevel->identifier = strdup(identifier);
+}
+
+static const struct ext_foreign_toplevel_handle_v1_listener foreign_toplevel_handle_listener = {
+	.closed = foreign_toplevel_handle_closed,
+	.done = foreign_toplevel_handle_done,
+	.title = foreign_toplevel_handle_title,
+	.app_id = foreign_toplevel_handle_app_id,
+	.identifier = foreign_toplevel_handle_identifier,
+};
+
+static void foreign_toplevel_list_handle_toplevel(void *data,
+		struct ext_foreign_toplevel_list_v1 *list,
+		struct ext_foreign_toplevel_handle_v1 *handle) {
+	struct xdpw_screencast_context *ctx = data;
+
+	struct xdpw_toplevel *toplevel = calloc(1, sizeof(*toplevel));
+	if (toplevel == NULL) {
+		return;
+	}
+
+	toplevel->handle = handle;
+	wl_list_insert(&ctx->toplevels, &toplevel->link);
+	ext_foreign_toplevel_handle_v1_add_listener(handle, &foreign_toplevel_handle_listener, toplevel);
+}
+
+static void foreign_toplevel_list_handle_finished(void *data,
+		struct ext_foreign_toplevel_list_v1 *list) {
+	struct xdpw_screencast_context *ctx = data;
+
+	struct xdpw_toplevel *toplevel, *toplevel_tmp;
+	wl_list_for_each_safe(toplevel, toplevel_tmp, &ctx->toplevels, link) {
+		foreign_toplevel_destroy(toplevel);
+	}
+
+	ext_foreign_toplevel_list_v1_destroy(ctx->ext_foreign_toplevel_list);
+	ctx->ext_foreign_toplevel_list = NULL;
+}
+
+static const struct ext_foreign_toplevel_list_v1_listener foreign_toplevel_list_listener = {
+	.toplevel = foreign_toplevel_list_handle_toplevel,
+	.finished = foreign_toplevel_list_handle_finished,
+};
+
 static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
 		uint32_t id, const char *interface, uint32_t ver) {
 	struct xdpw_screencast_context *ctx = data;
@@ -580,6 +475,32 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
 			reg, id, &zwlr_screencopy_manager_v1_interface, version);
 	}
 
+	if (!strcmp(interface, ext_output_image_capture_source_manager_v1_interface.name)) {
+		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, ver);
+		ctx->ext_output_image_capture_source_manager = wl_registry_bind(
+				reg, id, &ext_output_image_capture_source_manager_v1_interface, 1);
+	}
+
+	if (!strcmp(interface, ext_foreign_toplevel_image_capture_source_manager_v1_interface.name)) {
+		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, ver);
+		ctx->ext_foreign_toplevel_image_capture_source_manager = wl_registry_bind(
+				reg, id, &ext_foreign_toplevel_image_capture_source_manager_v1_interface, 1);
+	}
+
+	if (!strcmp(interface, ext_image_copy_capture_manager_v1_interface.name)) {
+		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, ver);
+		ctx->ext_image_copy_capture_manager = wl_registry_bind(
+				reg, id, &ext_image_copy_capture_manager_v1_interface, 1);
+	}
+
+	if (!strcmp(interface, ext_foreign_toplevel_list_v1_interface.name)) {
+		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, ver);
+		ctx->ext_foreign_toplevel_list = wl_registry_bind(
+				reg, id, &ext_foreign_toplevel_list_v1_interface, 1);
+		ext_foreign_toplevel_list_v1_add_listener(ctx->ext_foreign_toplevel_list,
+				&foreign_toplevel_list_listener, ctx);
+	}
+
 	if (strcmp(interface, wl_shm_interface.name) == 0) {
 		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, WL_SHM_VERSION);
 		ctx->shm = wl_registry_bind(reg, id, &wl_shm_interface, WL_SHM_VERSION);
@@ -595,13 +516,6 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
 		}
 		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, version);
 		ctx->linux_dmabuf = wl_registry_bind(reg, id, &zwp_linux_dmabuf_v1_interface, version);
-
-		if (version >= 4) {
-			ctx->linux_dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(ctx->linux_dmabuf);
-			zwp_linux_dmabuf_feedback_v1_add_listener(ctx->linux_dmabuf_feedback, &linux_dmabuf_listener_feedback, ctx);
-		} else {
-			zwp_linux_dmabuf_v1_add_listener(ctx->linux_dmabuf, &linux_dmabuf_listener, ctx);
-		}
 	}
 
 	if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0
@@ -626,16 +540,7 @@ static void wlr_registry_handle_remove(void *data, struct wl_registry *reg,
 		wl_list_for_each_safe(cast, tmp, &ctx->screencast_instances, link) {
 			if (cast->target->output == output) {
 				// screencopy might be in process for this instance
-				xdpw_wlr_session_close(cast);
-				// instance might be waiting for wakeup by the frame limiter
-				struct xdpw_timer *timer, *ttmp;
-				wl_list_for_each_safe(timer, ttmp, &cast->ctx->state->timers, link) {
-					if (timer->user_data == cast) {
-						xdpw_destroy_timer(timer);
-					}
-				}
-				cast->teardown = true;
-				xdpw_screencast_instance_teardown(cast);
+				xdpw_screencast_instance_destroy(cast);
 			}
 		}
 		wlr_remove_output(output);
@@ -650,13 +555,9 @@ static const struct wl_registry_listener wlr_registry_listener = {
 int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 	struct xdpw_screencast_context *ctx = &state->screencast;
 
-	// initialize a list of outputs
 	wl_list_init(&ctx->output_list);
-
-	// initialize a list of active screencast instances
 	wl_list_init(&ctx->screencast_instances);
-
-	// initialize a list of format modifier pairs
+	wl_list_init(&ctx->toplevels);
 	wl_array_init(&ctx->format_modifier_pairs);
 
 	// retrieve registry
@@ -667,31 +568,40 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 
 	logprint(DEBUG, "wayland: registry listeners run");
 
-	if (ctx->linux_dmabuf_feedback) {
+	if (ctx->ext_image_copy_capture_manager && ctx->ext_output_image_capture_source_manager) {
+		logprint(DEBUG, "wayland: using ext_image_copy_capture");
+	} else if (ctx->screencopy_manager && ctx->linux_dmabuf) {
+		if (zwp_linux_dmabuf_v1_get_version(ctx->linux_dmabuf) >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION) {
+			ctx->linux_dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(ctx->linux_dmabuf);
+			zwp_linux_dmabuf_feedback_v1_add_listener(ctx->linux_dmabuf_feedback, &linux_dmabuf_listener_feedback, ctx);
+		} else {
+			zwp_linux_dmabuf_v1_add_listener(ctx->linux_dmabuf, &linux_dmabuf_listener, ctx);
+		}
+
 		wl_display_roundtrip(state->wl_display);
 
 		logprint(DEBUG, "wayland: dmabuf_feedback listeners run");
+
+		// make sure we have a gbm device
+		if (!ctx->gbm) {
+			ctx->gbm = xdpw_gbm_device_create(NULL);
+			if (!ctx->gbm) {
+				logprint(ERROR, "System doesn't support gbm!");
+			}
+		}
+	} else {
+		logprint(ERROR, "Compositor supports neither ext_image_copy_capture or wlr_screencopy!");
+		return -1;
+	}
+
+	if (ctx->ext_image_copy_capture_manager && ctx->ext_foreign_toplevel_image_capture_source_manager) {
+		state->screencast_source_types |= WINDOW;
 	}
 
 	// make sure our wlroots supports shm protocol
 	if (!ctx->shm) {
 		logprint(ERROR, "Compositor doesn't support %s!", "wl_shm");
 		return -1;
-	}
-
-	// make sure our wlroots supports screencopy protocol
-	if (!ctx->screencopy_manager) {
-		logprint(ERROR, "Compositor doesn't support %s!",
-			zwlr_screencopy_manager_v1_interface.name);
-		return -1;
-	}
-
-	// make sure we have a gbm device
-	if (ctx->linux_dmabuf && !ctx->gbm) {
-		ctx->gbm = xdpw_gbm_device_create(NULL);
-		if (!ctx->gbm) {
-			logprint(ERROR, "System doesn't support gbm!");
-		}
 	}
 
 	if (ctx->xdg_output_manager) {
@@ -722,13 +632,27 @@ void xdpw_wlr_screencopy_finish(struct xdpw_screencast_context *ctx) {
 		wl_output_destroy(output->output);
 	}
 
+	struct xdpw_toplevel *toplevel, *toplevel_tmp;
+	wl_list_for_each_safe(toplevel, toplevel_tmp, &ctx->toplevels, link) {
+		foreign_toplevel_destroy(toplevel);
+	}
+
 	struct xdpw_screencast_instance *cast, *tmp_c;
 	wl_list_for_each_safe(cast, tmp_c, &ctx->screencast_instances, link) {
-		cast->quit = true;
+		xdpw_screencast_instance_destroy(cast);
 	}
 
 	if (ctx->screencopy_manager) {
 		zwlr_screencopy_manager_v1_destroy(ctx->screencopy_manager);
+	}
+	if (ctx->ext_image_copy_capture_manager) {
+		ext_image_copy_capture_manager_v1_destroy(ctx->ext_image_copy_capture_manager);
+	}
+	if (ctx->ext_output_image_capture_source_manager) {
+		ext_output_image_capture_source_manager_v1_destroy(ctx->ext_output_image_capture_source_manager);
+	}
+	if (ctx->ext_foreign_toplevel_image_capture_source_manager) {
+		ext_foreign_toplevel_image_capture_source_manager_v1_destroy(ctx->ext_foreign_toplevel_image_capture_source_manager);
 	}
 	if (ctx->shm) {
 		wl_shm_destroy(ctx->shm);
@@ -743,6 +667,9 @@ void xdpw_wlr_screencopy_finish(struct xdpw_screencast_context *ctx) {
 	}
 	if (ctx->linux_dmabuf) {
 		zwp_linux_dmabuf_v1_destroy(ctx->linux_dmabuf);
+	}
+	if (ctx->ext_foreign_toplevel_list) {
+		ext_foreign_toplevel_list_v1_destroy(ctx->ext_foreign_toplevel_list);
 	}
 	if (ctx->xdg_output_manager) {
 		zxdg_output_manager_v1_destroy(ctx->xdg_output_manager);
